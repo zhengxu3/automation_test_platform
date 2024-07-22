@@ -14,10 +14,10 @@ import datetime
 class TaskM(db.Document):
     task_name = StringField(required=True)
     task_type = StringField(required=True)
-    create_time = DateTimeField(default=datetime.datetime.utcnow)
-    run_time = DateTimeField()
+    create_time = StringField()
+    run_time = StringField()
     status = StringField()
-    case_list = ListField(db.StringField())
+    case_list = StringField()
     meta = {
         'collection': 'tasks_list'  # 指定集合名
     }

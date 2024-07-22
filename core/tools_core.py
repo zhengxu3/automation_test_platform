@@ -10,6 +10,7 @@ from datetime import datetime
 
 from flask import jsonify
 import logging
+import requests
 
 
 def make_response(data=None, message="Success", status=200):
@@ -20,29 +21,36 @@ def make_response(data=None, message="Success", status=200):
     }
     return jsonify(response), status
 
+def send_request(url,data):
+    try:
+        r = response = requests.post(url, data=data)
+    except Exception as e:
+        return ''
 
 def setup_logging(log_folder='logs'):
-    """
-    配置全局 logging
-    """
+    # 确保日志目录存在
+    os.makedirs(log_folder, exist_ok=True)
 
-    log_folder_path = os.path.join(os.path.dirname(__file__), log_folder)  # 在当前文件夹下创建日志文件夹
-    if not os.path.exists(log_folder_path):
-        os.makedirs(log_folder_path)
+    # 创建日志文件名，使用当前日期
+    log_filename = os.path.join(log_folder, 'app_%Y-%m-%d.log')
 
-    # 获取当前日期
-    current_date = datetime.now().strftime('%Y-%m-%d')
+    # 创建日志器
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
 
-    # 设置日志文件路径
-    log_file_path = os.path.join(log_folder, f'app_{current_date}.log')
+    # 创建文件处理器
+    file_handler = logging.FileHandler(log_filename)
+    file_handler.setLevel(logging.INFO)
 
-    # 配置 logging
-    logging.basicConfig(
-        level=logging.INFO,  # 可以设置为 DEBUG, INFO, WARNING, ERROR, CRITICAL
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),  # 将日志输出到标准输出
-            logging.FileHandler(log_file_path)  # 将日志输出到文件
-        ]
-    )
-    logging.info("Logging is set up.")
+    # 创建格式化器并添加到处理器
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+
+    # 添加处理器到日志器
+    logger.addHandler(file_handler)
+
+    # 创建控制台处理器（可选）
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)

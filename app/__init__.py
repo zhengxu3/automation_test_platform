@@ -1,20 +1,21 @@
 from flask import Flask
 from .home.index_page import index_page_bp
+from .openapi.callback import call_back_bp
 from flask_mongoengine import MongoEngine
 # from .user.views import user_bp
 
 from mongoengine import Document, BooleanField, StringField, EmailField, DateTimeField
+import random
 from config import config
 from core.tools_core import *
 from core.tools_core import setup_logging
-
-import random
 setup_logging()
+
 
 def create_app(config_name='default'):
     app = Flask(__name__)
-
     logging.info('start flask app')
+
     app.config.from_object(config[config_name])
     db = MongoEngine()
 
@@ -36,6 +37,6 @@ def create_app(config_name='default'):
 
     # 注册蓝图
     app.register_blueprint(index_page_bp, url_prefix='/home')
-    # app.register_blueprint(user_bp, url_prefix='/user')
+    app.register_blueprint(call_back_bp, url_prefix='/openapi')
 
     return app
