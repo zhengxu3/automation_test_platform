@@ -21,11 +21,13 @@ def make_response(data=None, message="Success", status=200):
     }
     return jsonify(response), status
 
-def send_request(url,data):
+
+def send_request(url, data, headers):
     try:
-        r = response = requests.post(url, data=data)
+        r = requests.post(url, data=data, headers=headers)
     except Exception as e:
         return ''
+    return r
 
 def setup_logging(log_folder='logs'):
     # 确保日志目录存在

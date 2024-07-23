@@ -9,9 +9,9 @@ import json
 
 from flask import Blueprint, request
 
-from models.task_m import *
-from models.step_info import *
-from models.step_list import *
+# from models.task_m import *
+# from models.step_info import *
+from models.callback import Callback
 from core.tools_core import *
 import datetime
 
@@ -25,16 +25,13 @@ def create_task():
         # # 检查必填字段是否存在
         # if not data.get('task_name') or not data.get('task_type'):
         #     return make_response(message="task_name and task_type are required", status=400)
+        res_list = []
+        for users in data['body']['match_pairs'][0]['match_request_items']:
+            union_uid = str(users['users'][0]['union_uid'])
+            res_list.append(union_uid)
+            Callback.create_callback(union_uid)
 
-        # 创建 TaskM 实例
-        task_id = TaskM.create_task(
-            task_name=data['task_name'],
-            task_type=data['task_type'],
-            run_time=data['run_time'],
-            status=data.get('status'),
-            case_list=json.dumps(data.get('case_list', []))
-        )
-        return make_response(data={"task_id": task_id}, status=201)
+        return make_response(data={"callback_user": res_list}, status=201)
 
     except Exception as e:
         return make_response(message=str(e), status=500)
