@@ -1,0 +1,39 @@
+# AI Service 配置
+# 密钥请在 config.local.yaml 中覆盖（不提交 git）
+
+app:
+  env: test  # test / production
+  port: 5010
+  host: 0.0.0.0
+
+mongodb:
+  uri: ${MONGO_URI}  # config.local.yaml 覆盖
+  db_name: ai_platform
+  db_name_test: ai_platform_test
+
+llm:
+  fallback_chain: ["gemini_flash", "gemini_pro", "deepseek"]
+  models:
+    gemini_flash:
+      provider: gemini
+      model_name: gemini-2.5-flash
+      api_key: ${GEMINI_API_KEY}
+      temperature: 0.2
+    gemini_pro:
+      provider: gemini
+      model_name: gemini-2.5-pro
+      api_key: ${GEMINI_API_KEY}
+      temperature: 0.1
+    deepseek:
+      provider: openai_compatible
+      model_name: deepseek-chat
+      api_key: ${DEEPSEEK_API_KEY}
+      base_url: https://api.deepseek.com/v1
+
+git:
+  repo_base_path: /data/repos
+
+worker:
+  poll_interval: 5
+  max_concurrency: 20
+  goal_poll_interval: 120  # Goal 唤醒间隔（秒）

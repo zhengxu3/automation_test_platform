@@ -1,0 +1,18 @@
+server:
+  host: "0.0.0.0"
+  bi_port: 5007
+  ws_port: 5008
+
+device:
+  poll_interval: 10
+  task_poll_interval: 5
+  lock_timeout: 1800
+  screen_fps: 1.5
+  apk_dir: "~/apks"
+
+collections:
+  device_pool: "device_pool"
+  task_queue: "device_task_queue"
+  task_results: "device_task_results"
+  app_registry: "app_registry"
+  app_pages: "app_pages"
