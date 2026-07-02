@@ -189,4 +189,14 @@ async def main():
 
 
 if __name__ == "__main__":
+    # 启动 code_watcher 后台线程（随 worker 进程存活）
+    import threading
+    def _run_watcher():
+        try:
+            from engine.code_watcher import run_loop
+            run_loop(30)
+        except Exception as e:
+            print(f"⚠️ code_watcher 异常退出: {e}")
+    threading.Thread(target=_run_watcher, daemon=True, name="code_watcher").start()
+
     asyncio.run(main())

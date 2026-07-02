@@ -117,11 +117,17 @@ def resolve(capability_key: str, goal: dict, step: dict = None, prior_artifacts:
 
     if capability_key == "branch_review":
         repo = _repo_for_step(sources, step)
+        # before_ref/after_ref：从 source 的 last_before/commit 取（code_update_round 时写入）
+        # 没有时 branch_review_task 会退回 HEAD~1
+        before_ref = repo.get("last_before") or repo.get("before_ref") or None
+        after_ref = repo.get("commit") or repo.get("after_ref") or None
         return {
             "repo_name": repo.get("repo_id", ""),
             "repo_path": repo.get("local_path", ""),
             "base_branch": repo.get("base_branch") or repo.get("branch", "master"),
             "target_branch": repo.get("target_branch") or repo.get("branch", "master"),
+            "before_ref": before_ref,
+            "after_ref": after_ref,
             "inputs": {"mode": "最近更新"},
         }
 

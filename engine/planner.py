@@ -104,15 +104,19 @@ def generate_plan(goal_statement: str, acceptance: list, profile: dict,
     )
     acc_text = "\n".join(
         f"- {a.get('id')}: {a.get('desc')} "
-        f"(证据类型: {a.get('evidence_type', '?')}, source_ref: {a.get('source_ref', '') or '无'})"
+        f"(objective: {a.get('objective_id', '') or '未绑定'}, "
+        f"证据类型: {a.get('evidence_type', '?')}, "
+        f"覆盖角色: {a.get('coverage_role', 'required')}, "
+        f"source_ref: {a.get('source_ref', '') or '无'})"
         for a in acceptance
     )
 
     system = (
         "你是测试编排规划器(Planner)。把目标拆解成最小必要的步骤序列(DAG)。\n"
+        "注意：objective 是上层业务/技术目标，acceptance 是证明目标成立的验收条件，测试用例只是执行资产。\n"
         "规则：\n"
         "1. 只能使用下方提供的能力，不能臆造能力\n"
-        "2. 每步必须服务于某个验收点\n"
+        "2. 每步必须服务于某个验收点；不要把单条测试用例当成新的 objective\n"
         "3. 有依赖的步骤用 depends_on 表达（如先分析代码再生成测试）\n"
         "4. 当前不可执行的能力(can_execute_now=false)仍可规划，但要标记 needs_upgrade\n"
         "5. 步骤要最小必要，不要冗余\n"

@@ -77,6 +77,102 @@ class TestFeasibility:
         assert "env:apk" in p["upgrade_hints"]["device_test"]
 
 
+# ==================== 目标/验收分层（纯逻辑，不调LLM）====================
+
+class TestGoalObjectiveLayer:
+    def _stub_structured(self, monkeypatch, data):
+        monkeypatch.setattr(
+            steward,
+            "generate_structured",
+            lambda *args, **kwargs: st.StructuredResult(
+                ok=True, data=data, raw="{}", usage={}, attempts=1
+            ),
+        )
+
+    def test_generate_goal_adds_objective_layer(self, monkeypatch):
+        self._stub_structured(monkeypatch, {
+            "goal_statement": "登录能力稳定可用",
+            "objectives": [
+                {"objective_id": "obj_login", "title": "登录稳定", "source": "doc", "confidence": 0.8}
+            ],
+            "acceptance": [
+                {"id": "a1", "desc": "登录流程不再崩溃", "evidence_type": "doc_review"}
+            ],
+            "confidence": 0.8,
+            "rationale": "来自需求文档",
+        })
+
+        result = steward.generate_goal(
+            title="验证登录崩溃修复",
+            doc_content="修复登录崩溃",
+            input_mode="doc_only",
+            allowed_evidence=["doc_review"],
+        )
+
+        assert result["objectives"][0]["objective_id"] == "obj_login"
+        assert result["acceptance"][0]["objective_id"] == "obj_login"
+        assert result["acceptance"][0]["bound_to"] is None
+        assert result["acceptance"][0]["verdict"] == "pending"
+        assert result["acceptance"][0]["coverage_role"] == "required"
+
+    def test_synthesize_code_only_derives_code_objective_when_llm_empty(self, monkeypatch):
+        self._stub_structured(monkeypatch, {
+            "goal_statement": "代码变更风险可控",
+            "objectives": [],
+            "acceptance": [],
+            "confidence": 0.45,
+            "rationale": "LLM 未产出，走兜底",
+        })
+
+        result = steward.synthesize_goal_from_probe(
+            title="后端提交检查",
+            input_mode="repo_only",
+            allowed_evidence=["static_analysis"],
+            probe_outputs=[{
+                "type": "code_scan",
+                "source_ref": "repo_api",
+                "summary": "Flask 后端",
+                "data": {"project_type": "backend"},
+            }],
+        )
+
+        assert result["objectives"]
+        assert result["acceptance"]
+        acc = result["acceptance"][0]
+        assert acc["evidence_type"] == "static_analysis"
+        assert acc["source_ref"] == "repo_api"
+        assert acc["objective_id"].startswith("obj_code")
+        assert any(o["objective_id"] == acc["objective_id"] for o in result["objectives"])
+
+    def test_synthesize_does_not_promote_test_cases_to_objectives(self, monkeypatch):
+        self._stub_structured(monkeypatch, {
+            "goal_statement": "需求被覆盖",
+            "objectives": [],
+            "acceptance": [],
+            "confidence": 0.6,
+            "rationale": "LLM 未产出，走兜底",
+        })
+
+        result = steward.synthesize_goal_from_probe(
+            title="验证匹配策略",
+            input_mode="doc_only",
+            allowed_evidence=["testcase_generated"],
+            probe_outputs=[{
+                "type": "requirement_analysis",
+                "summary": "需求拆解",
+                "data": {
+                    "acceptance_points": ["女性资源过多时 VIP 匹配成功率策略被覆盖"],
+                    "test_cases": ["用例1：点击按钮", "用例2：切换筛选项"],
+                },
+            }],
+        )
+
+        assert result["acceptance"][0]["desc"] == "女性资源过多时 VIP 匹配成功率策略被覆盖"
+        titles = {o["title"] for o in result["objectives"]}
+        assert "用例1：点击按钮" not in titles
+        assert "用例2：切换筛选项" not in titles
+
+
 # ==================== 目标生成稳定性（真实调 LLM）====================
 
 @pytest.mark.llm

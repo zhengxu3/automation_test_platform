@@ -483,12 +483,162 @@ def on_step_done(goal_id: str, step_id: str, output: dict, success: bool = None)
         state.emit_event(db, goal_id, "steward_evaluated", {
             "step_id": step_id, "conclusion": eval_result.get("conclusion", "")
         }, actor="steward")
+
+        # 4.5 Case Reminder 钩子：branch_review 完成后触发 case 匹配
+        if cap == "branch_review":
+            _trigger_case_reminder(goal_id, step, output, db)
     else:
         # 失败 → 重试策略
         _handle_failure(goal_id, step, output)
 
     # 4. 推进 DAG
     return advance(goal_id)
+
+
+def _get_commit_message(local_path: str, commit_ref: str) -> str:
+    """从 git log 取真实 commit message"""
+    if not local_path or not commit_ref:
+        return ""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["git", "log", "-1", "--format=%s", commit_ref],
+            cwd=local_path, stderr=subprocess.DEVNULL, timeout=5
+        ).decode().strip()
+        return out[:100]
+    except Exception:
+        return ""
+
+
+def _infer_reach_scenarios(blast_radius: list, ripple_methods: list,
+                           change_summary: str, uncovered: list) -> dict:
+    """LLM 轻量推断：方法名 → 用户可操作的触达场景。
+
+    输出 {method: {scenario, page, steps, reachable}}
+    失败不阻塞通知（返回空 dict）。
+    """
+    if not blast_radius and not ripple_methods:
+        return {}
+    try:
+        from llm.structured import generate_structured
+        methods_desc = []
+        for br in (blast_radius or []):
+            methods_desc.append(f"[主动修改] {br.get('class_name','')}.{br.get('name','')}")
+        for rp in (ripple_methods or [])[:6]:
+            methods_desc.append(f"[被调用方] {rp.get('class_name','')}.{rp.get('name','')} — {rp.get('reason','')}")
+
+        r = generate_structured(
+            system_prompt=(
+                "你是 QA 测试专家。根据后端方法名和变更摘要，推断每个方法对应的**客户端用户操作场景**。\n"
+                "目标：告诉测试人员'要验证这个改动，客户端需要做什么操作才能触发到这段代码'。\n"
+                "如果无法确定具体场景，标记 reachable=false 并说明原因。"
+            ),
+            user_prompt=(
+                f"变更摘要：{change_summary[:300]}\n\n"
+                f"涉及方法：\n" + "\n".join(methods_desc) + "\n\n"
+                f"对每个未覆盖的模块给出触达分析，输出 JSON：\n"
+                '{"scenarios": [{"method": "Class.method", "scenario": "对应的客户端场景（如：组队匹配成功）", '
+                '"page": "对应页面/入口（如：匹配大厅→组队）", '
+                '"steps": "触达步骤（如：1.创建4人队伍 2.邀请低版本用户加入 3.观察队伍广播）", '
+                '"reachable": true, "reason": ""}]}'
+            ),
+            schema={"required": ["scenarios"], "types": {"scenarios": "list"}},
+            default={"scenarios": []},
+            require_confidence=False,
+        )
+        result = {}
+        for s in (r.data.get("scenarios") or []):
+            method = s.get("method", "")
+            if method:
+                result[method] = s
+        return result
+    except Exception:
+        return {}
+
+
+def _trigger_case_reminder(goal_id: str, step: dict, output: dict, db):
+    """branch_review 完成后：匹配 case → emit event → 存 artifact → 通知"""
+    try:
+        cases = list(get_collection("ai_goal_cases").find({"goal_id": goal_id}, {"_id": 0}))
+        if not cases:
+            return
+        affected_modules = output.get("affected_modules") or output.get("modules") or []
+        interface_doc = output.get("interface_doc") or output.get("interfaces") or []
+        from engine.case_matcher import match_cases
+        reminder = match_cases(affected_modules, interface_doc, cases,
+                               change_summary=output.get("change_summary", ""),
+                               risk_points=output.get("risk_points") or [],
+                               blast_radius=(output.get("interface_doc") or {}).get("blast_radius") or [])
+        if not reminder.get("hit_cases") and not reminder.get("uncovered_changes"):
+            return
+        # 附加代码分析产出摘要供前端完整展示
+        interface_doc = output.get("interface_doc") or {}
+        ev_doc = state.emit_event(db, goal_id, "case_reminder", {
+            "step_id": step["step_id"],
+            "hit_cases": reminder.get("hit_cases", []),
+            "uncovered_changes": reminder.get("uncovered_changes", []),
+            "hit_count": len(reminder.get("hit_cases", [])),
+            "uncovered_count": len(reminder.get("uncovered_changes", [])),
+            "summary": reminder.get("summary"),
+            "blast_radius": interface_doc.get("blast_radius", []),
+            "ripple_methods": interface_doc.get("ripple_methods", []),
+            "ast_summary": interface_doc.get("ast_summary"),
+            "change_summary": (output.get("change_summary") or "")[:500],
+            "affected_endpoints": interface_doc.get("affected_endpoints", []),
+        }, actor="scheduler")
+        event_id = str(ev_doc.get("_id", "")) if ev_doc else ""
+        # 存 artifact
+        get_collection("ai_goal_artifacts").insert_one({
+            "artifact_id": f"art_case_{uuid.uuid4().hex[:8]}",
+            "goal_id": goal_id,
+            "step_id": step["step_id"],
+            "phase": "step",
+            "type": "case_reminder",
+            "data": reminder,
+            "created_at": int(time.time()),
+        })
+        # 钉钉通知
+        goal = get_collection("ai_goals").find_one({"goal_id": goal_id}, {"_id": 0, "title": 1})
+        from common.notify import notify_case_reminder
+        # 组装 commit_info
+        _goal_full = get_collection("ai_goals").find_one({"goal_id": goal_id}, {"_id": 0, "title": 1, "sources": 1})
+        _src = next((s for s in (_goal_full or {}).get("sources", []) if s.get("repo_id") == step.get("source_ref")), {})
+        _git_url = _src.get("git_url", "")
+        _repo_label = _git_url.split("/")[-1].replace(".git", "") if "/" in _git_url else step.get("source_ref", "")
+        _role = _src.get("role", "")
+        _commit_info = {
+            "repo_name": f"{_role + ' · ' if _role else ''}{_repo_label}",
+            "branch": _src.get("branch", ""),
+            "commit": _src.get("commit", ""),
+            "message": _get_commit_message(_src.get("local_path", ""), _src.get("commit", "")),
+            "changed_files": affected_modules,
+            "touched_sides": ["backend"] if _role == "backend" else ["client"] if _role in ("android", "ios") else ["web"] if _role == "web" else [],
+        }
+        # LLM 轻量推断：方法名 → 用户可操作的触达场景
+        reach_analysis = _infer_reach_scenarios(
+            blast_radius=(output.get("interface_doc") or {}).get("blast_radius", []),
+            ripple_methods=(output.get("interface_doc") or {}).get("ripple_methods", []),
+            change_summary=output.get("change_summary", ""),
+            uncovered=reminder.get("uncovered_changes", []),
+        )
+        notify_case_reminder(goal_id, (_goal_full or {}).get("title", ""), reminder,
+                             commit_info=_commit_info, event_id=event_id,
+                             blast_radius=(output.get("interface_doc") or {}).get("blast_radius", []),
+                             change_summary=(output.get("change_summary") or "")[:500],
+                             ripple_methods=(output.get("interface_doc") or {}).get("ripple_methods", []),
+                             reach_analysis=reach_analysis)
+        # 回写 reach_analysis 到事件（供前端详情页使用）
+        if reach_analysis and event_id:
+            try:
+                from bson import ObjectId
+                get_collection("ai_goal_events").update_one(
+                    {"_id": ObjectId(event_id)},
+                    {"$set": {"payload.reach_analysis": reach_analysis}})
+            except Exception:
+                pass
+    except Exception as e:
+        import traceback
+        print(f"⚠️ _trigger_case_reminder error: {e}\n{traceback.format_exc()[:300]}")
 
 
 def _save_artifact(goal_id: str, step: dict, output: dict):
@@ -713,6 +863,54 @@ def _verify_goal(goal_id: str) -> dict:
     return {"ok": True, "status": "partial_completed", "passed": len(passed), "total": len(acceptance)}
 
 
+def _objective_summary(goal: dict) -> list:
+    objectives = goal.get("objectives", []) or []
+    acceptance = goal.get("acceptance", []) or []
+    by_obj = {}
+    for a in acceptance:
+        by_obj.setdefault(a.get("objective_id", ""), []).append(a)
+
+    rows = []
+    for obj in objectives:
+        oid = obj.get("objective_id", "")
+        acc = by_obj.get(oid, [])
+        passed = [a for a in acc if a.get("verdict") == "pass"]
+        rows.append({
+            "objective_id": oid,
+            "title": obj.get("title", ""),
+            "source": obj.get("source", ""),
+            "scope": obj.get("scope", []),
+            "priority": obj.get("priority", ""),
+            "status": "pass" if acc and len(passed) == len(acc) else "pending",
+            "passed_acceptance": len(passed),
+            "total_acceptance": len(acc),
+            "unmet_acceptance": [
+                {"id": a.get("id"), "desc": a.get("desc", ""), "verdict": a.get("verdict", "pending")}
+                for a in acc if a.get("verdict") != "pass"
+            ],
+        })
+
+    # 兼容旧数据：验收点没有 objective_id 时也不要丢。
+    orphan = by_obj.get("", [])
+    if orphan:
+        passed = [a for a in orphan if a.get("verdict") == "pass"]
+        rows.append({
+            "objective_id": "",
+            "title": "未分组验收",
+            "source": "legacy",
+            "scope": [],
+            "priority": "",
+            "status": "pass" if len(passed) == len(orphan) else "pending",
+            "passed_acceptance": len(passed),
+            "total_acceptance": len(orphan),
+            "unmet_acceptance": [
+                {"id": a.get("id"), "desc": a.get("desc", ""), "verdict": a.get("verdict", "pending")}
+                for a in orphan if a.get("verdict") != "pass"
+            ],
+        })
+    return rows
+
+
 def _generate_summary(goal_id: str, final_status: str):
     """生成不可变最终总结快照"""
     goal = get_collection("ai_goals").find_one({"goal_id": goal_id}, {"_id": 0})
@@ -737,8 +935,15 @@ def _generate_summary(goal_id: str, final_status: str):
             "skipped": sum(1 for s in steps if s["status"] == "skipped"),
             "total_attempts": sum(len(s.get("attempts", [])) for s in steps),
         },
+        "objective_summary": _objective_summary(goal),
         "acceptance_summary": [
-            {"id": a["id"], "desc": a["desc"], "verdict": a.get("verdict", "pending"), "evidence_ref": a.get("bound_to")}
+            {
+                "id": a["id"],
+                "objective_id": a.get("objective_id", ""),
+                "desc": a["desc"],
+                "verdict": a.get("verdict", "pending"),
+                "evidence_ref": a.get("bound_to"),
+            }
             for a in acceptance
         ],
         "evidence_collected": len(evidence),

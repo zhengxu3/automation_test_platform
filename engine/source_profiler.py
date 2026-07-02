@@ -148,6 +148,19 @@ def profile_sources(sources: list) -> dict:
             })
             doc_i += 1
 
+        elif stype == "testcase":
+            has_doc = True  # testcase 也算文档输入（有文本内容可分析）
+            available.add("doc")
+            available.add("testcase")
+            available_sources.append("testcase")
+            docs.append({
+                "source_id": src.get("source_id") or f"src_doc_{doc_i}",
+                "kind": "testcase",
+                "capabilities": ["doc", "testcase"],
+                "content_len": len(src.get("content") or ""),
+            })
+            doc_i += 1
+
         elif stype == "repo":
             has_repo = True
             available_sources.append("repo")

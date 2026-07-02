@@ -47,10 +47,35 @@ def _acceptance_decisions(acceptance: list) -> list:
         et = a.get("evidence_type", "")
         rows.append({
             "acceptance_id": a.get("id", ""),
+            "objective_id": a.get("objective_id", ""),
             "desc": a.get("desc", ""),
             "side": a.get("side", ""),
             "evidence_type": et,
+            "coverage_role": a.get("coverage_role", "required"),
             "why": _evidence_reason(et),
+        })
+    return rows
+
+
+def _objective_decisions(objectives: list, acceptance: list) -> list:
+    """目标分配表：objective → 覆盖它的验收点数量。"""
+    counts = {}
+    for a in acceptance or []:
+        oid = a.get("objective_id", "")
+        if oid:
+            counts[oid] = counts.get(oid, 0) + 1
+    rows = []
+    for obj in objectives or []:
+        oid = obj.get("objective_id", "")
+        rows.append({
+            "objective_id": oid,
+            "title": obj.get("title", ""),
+            "source": obj.get("source", ""),
+            "scope": obj.get("scope", []),
+            "priority": obj.get("priority", ""),
+            "confidence": obj.get("confidence", 0.0),
+            "needs_confirmation": obj.get("needs_confirmation", False),
+            "acceptance_count": counts.get(oid, 0),
         })
     return rows
 
@@ -58,6 +83,7 @@ def _acceptance_decisions(acceptance: list) -> list:
 def _emit_steward_thinking(db, goal_id: str, goal_result: dict, *,
                            source: str, profile: dict = None):
     """让主管/记忆体把目标拆解的思考过程显式告诉前端。"""
+    objectives = goal_result.get("objectives", []) or []
     acceptance = goal_result.get("acceptance", []) or []
     state.emit_event(db, goal_id, "steward_thinking", {
         "source": source,
@@ -66,6 +92,9 @@ def _emit_steward_thinking(db, goal_id: str, goal_result: dict, *,
         "confidence": goal_result.get("confidence", 0.0),
         "input_mode": (profile or {}).get("input_mode", ""),
         "target_evidence": (profile or {}).get("max_evidence_strength"),
+        "objective_count": len(objectives),
+        "objective_decisions": _objective_decisions(objectives, acceptance),
+        "objectives": objectives,
         "acceptance_decisions": _acceptance_decisions(acceptance),
     }, actor="steward")
 
@@ -82,6 +111,7 @@ def _step_thinking_rows(steps: list, capabilities: list, acceptance: list = None
             a = acc_map.get(aid, {})
             serves.append({
                 "acceptance_id": aid,
+                "objective_id": a.get("objective_id", ""),
                 "desc": a.get("desc", ""),
                 "evidence_type": a.get("evidence_type", ""),
             })
@@ -393,16 +423,20 @@ def discover_and_plan(goal_id: str) -> dict:
     memory_ctx = steward.retrieve_memory(req_id=goal.get("req_id", ""), verified_only=True)
 
     doc_content = ""
+    testcase_content = ""
     code_summary = ""
     for src in sources:
         if src.get("type") == "doc":
-            doc_content = src.get("content", "") or src.get("doc_content", "")
+            doc_content += (src.get("content", "") or src.get("doc_content", "")) + "\n"
+        elif src.get("type") == "testcase":
+            testcase_content += (src.get("content", "") or "") + "\n"
         if src.get("type") == "repo":
             code_summary += f"仓库 {src.get('repo_id')}/{src.get('branch', '')} "
 
     goal_result = steward.generate_goal(
         title=goal.get("title", ""),
-        doc_content=doc_content,
+        doc_content=doc_content.strip(),
+        testcase_content=testcase_content.strip(),
         code_summary=code_summary,
         input_mode=profile["input_mode"],
         memory_context=memory_ctx,
@@ -411,6 +445,7 @@ def discover_and_plan(goal_id: str) -> dict:
 
     goals.update_one({"goal_id": goal_id}, {"$set": {
         "goal_statement": goal_result["goal_statement"],
+        "objectives": goal_result.get("objectives", []),
         "acceptance": goal_result["acceptance"],
         "goal_confidence": goal_result["confidence"],
         "goal_rationale": goal_result.get("rationale", ""),
@@ -419,6 +454,7 @@ def discover_and_plan(goal_id: str) -> dict:
     _emit_steward_thinking(db, goal_id, goal_result, source="fallback_raw_sources", profile=profile)
     state.emit_event(db, goal_id, "goal_generated", {
         "goal_statement": goal_result["goal_statement"],
+        "objective_count": len(goal_result.get("objectives", [])),
         "acceptance_count": len(goal_result["acceptance"]),
         "confidence": goal_result["confidence"],
     }, actor="steward")
@@ -749,25 +785,32 @@ def _fallback_generate_goal(goal_id: str, profile: dict, policy: dict) -> dict:
     goal = goals.find_one({"goal_id": goal_id}, {"_id": 0})
     db = goals.database
     memory_ctx = steward.retrieve_memory(req_id=goal.get("req_id", ""), verified_only=True)
-    doc_content, code_summary = "", ""
+    doc_content, testcase_content, code_summary = "", "", ""
     for src in goal.get("sources", []):
         if src.get("type") == "doc":
-            doc_content = src.get("content", "") or src.get("doc_content", "")
+            doc_content += (src.get("content", "") or src.get("doc_content", "")) + "\n"
+        elif src.get("type") == "testcase":
+            testcase_content += (src.get("content", "") or "") + "\n"
         if src.get("type") == "repo":
             code_summary += f"仓库 {src.get('repo_id')}/{src.get('branch', '')} "
     gr = steward.generate_goal(
-        title=goal.get("title", ""), doc_content=doc_content, code_summary=code_summary,
+        title=goal.get("title", ""), doc_content=doc_content.strip(),
+        testcase_content=testcase_content.strip(), code_summary=code_summary,
         input_mode=profile["input_mode"], memory_context=memory_ctx,
         allowed_evidence=_effective_evidence(profile),
     )
     goals.update_one({"goal_id": goal_id}, {"$set": {
-        "goal_statement": gr["goal_statement"], "acceptance": gr["acceptance"],
+        "goal_statement": gr["goal_statement"],
+        "objectives": gr.get("objectives", []),
+        "acceptance": gr["acceptance"],
         "goal_confidence": gr["confidence"], "goal_rationale": gr.get("rationale", ""),
         "target_state": "confirmed",
     }})
     _emit_steward_thinking(db, goal_id, gr, source="fallback_raw_sources", profile=profile)
     state.emit_event(db, goal_id, "goal_generated", {
-        "goal_statement": gr["goal_statement"], "acceptance_count": len(gr["acceptance"]),
+        "goal_statement": gr["goal_statement"],
+        "objective_count": len(gr.get("objectives", [])),
+        "acceptance_count": len(gr["acceptance"]),
         "confidence": gr["confidence"],
     }, actor="steward")
     current_kind = goal.get("current_plan_kind") or "discovery"
@@ -812,13 +855,17 @@ def complete_discovery_plan(goal_id: str) -> dict:
         allowed_evidence=_effective_evidence(profile), memory_context=memory_ctx,
     )
     goals.update_one({"goal_id": goal_id}, {"$set": {
-        "goal_statement": gr["goal_statement"], "acceptance": gr["acceptance"],
+        "goal_statement": gr["goal_statement"],
+        "objectives": gr.get("objectives", []),
+        "acceptance": gr["acceptance"],
         "goal_confidence": gr["confidence"], "goal_rationale": gr.get("rationale", ""),
         "target_state": "confirmed",
     }})
     _emit_steward_thinking(db, goal_id, gr, source="discovery_plan", profile=profile)
     state.emit_event(db, goal_id, "goal_generated", {
-        "goal_statement": gr["goal_statement"], "acceptance_count": len(gr["acceptance"]),
+        "goal_statement": gr["goal_statement"],
+        "objective_count": len(gr.get("objectives", [])),
+        "acceptance_count": len(gr["acceptance"]),
         "confidence": gr["confidence"], "from": "discovery_plan",
     }, actor="steward")
 
@@ -918,6 +965,9 @@ def trigger_code_update_round(goal_id: str, reason: str = "代码更新", sides=
         if not is_verification_grade(a.get("evidence_type", "")):
             continue
         if reset_ids is None or a.get("id") in reset_ids:
+            # 如果指定了 changed_repo_id，只重置该 repo 的验收点
+            if changed_repo_id and a.get("source_ref") and a.get("source_ref") != changed_repo_id:
+                continue
             a["verdict"] = "pending"
             a["bound_to"] = None
     goals.update_one({"goal_id": goal_id}, {"$set": {
@@ -941,6 +991,9 @@ def trigger_code_update_round(goal_id: str, reason: str = "代码更新", sides=
     # side gating：只规划"未通过"的验收点（被重置的触及 side + 历史未达成），
     # 已通过/已准备的不再重跑 —— 改后端这轮就只排 api、不重排 web。
     active_acc = [a for a in acc if a.get("verdict") not in ("pass", "prepared", "not_applicable")]
+    # 只规划被改动 repo 的验收点
+    if changed_repo_id:
+        active_acc = [a for a in active_acc if not a.get("source_ref") or a.get("source_ref") == changed_repo_id]
     plan_acc = active_acc or acc
     return _schedule_plan_transition(
         goal_id, from_kind=goal.get("current_plan_kind", "objective"), to_kind="objective",
@@ -1088,12 +1141,17 @@ def on_probe_done(goal_id: str, agent_id: str, output: dict) -> dict:
         allowed_evidence=_effective_evidence(profile), memory_context=memory_ctx,
     )
     goals.update_one({"goal_id": goal_id}, {"$set": {
-        "goal_statement": gr["goal_statement"], "acceptance": gr["acceptance"],
+        "goal_statement": gr["goal_statement"],
+        "objectives": gr.get("objectives", []),
+        "acceptance": gr["acceptance"],
         "goal_confidence": gr["confidence"], "goal_rationale": gr.get("rationale", ""),
+        "target_state": "confirmed",
     }})
     _emit_steward_thinking(db, goal_id, gr, source="legacy_probe", profile=profile)
     state.emit_event(db, goal_id, "goal_generated", {
-        "goal_statement": gr["goal_statement"], "acceptance_count": len(gr["acceptance"]),
+        "goal_statement": gr["goal_statement"],
+        "objective_count": len(gr.get("objectives", [])),
+        "acceptance_count": len(gr["acceptance"]),
         "confidence": gr["confidence"], "from": "probe",
     }, actor="steward")
     return _plan_and_start(goal_id, profile, policy, gr["goal_statement"],
@@ -1197,24 +1255,26 @@ def get_goal_full(goal_id: str) -> dict:
     steps = list(get_collection("ai_goal_steps").find(
         {"goal_id": goal_id, "superseded_by": {"$exists": False}}, {"_id": 0}
     ).sort("step_id", 1))
-    # 历史 step（被 replan 取代的旧计划，append-only 保留，供回放）
+    # 历史 step（被 replan 取代的旧计划）— 只返回轻量字段供回放标题
     superseded = list(get_collection("ai_goal_steps").find(
-        {"goal_id": goal_id, "superseded_by": {"$exists": True}}, {"_id": 0}
+        {"goal_id": goal_id, "superseded_by": {"$exists": True}},
+        {"_id": 0, "step_id": 1, "capability_key": 1, "status": 1, "plan_version": 1,
+         "superseded_by": 1, "agent_name": 1, "source_ref": 1, "evidence_type": 1}
     ).sort([("plan_version", 1), ("step_id", 1)]))
-    events = _latest_events(goal_id, limit=300)
+    # 事件流：最近 100 条（前端按需加载更多）
+    events = _latest_events(goal_id, limit=100)
     evidence = list(get_collection("ai_goal_evidence").find(
         {"goal_id": goal_id}, {"_id": 0}
     ).sort("created_at", 1))
+    # 产物：排除 data 大字段 + 限制最近 50 条
     artifacts = list(get_collection("ai_goal_artifacts").find(
         {"goal_id": goal_id}, {"_id": 0, "data": 0}
-    ).sort("created_at", 1))
+    ).sort("created_at", -1).limit(50))
+    artifacts.reverse()
     summary = get_collection("ai_goal_summary").find_one({"goal_id": goal_id}, {"_id": 0})
-    # 工作集合实例：探查阶段(phase=probe)+执行阶段(phase=step)的智能体，供前端显性化"谁在干活"
-    # （之前只从 plan steps 派生智能体，探查阶段的需求分析/代码分析被藏起来了）
     agents = list(get_collection("ai_workspace_agents").find(
         {"goal_id": goal_id}, {"_id": 0}
     ).sort([("phase", 1), ("installed_at", 1)]))
-    # 记忆点（按 goal_id）
     memories = list(get_collection("ai_memory_points").find(
         {"goal_id": goal_id}, {"_id": 0}
     ).sort("created_at", -1).limit(30))

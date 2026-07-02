@@ -7,6 +7,7 @@ from flask import Flask
 from flask_cors import CORS
 
 _goal_watchdog_started = False
+_code_watcher_started = False
 
 
 def _truthy(value) -> bool:
@@ -41,6 +42,21 @@ def _start_goal_watchdog_once():
     threading.Thread(target=loop, name="goal-watchdog", daemon=True).start()
 
 
+def _start_code_watcher_once():
+    """启动代码自监控轮询线程。gateway 默认关闭（由 worker 负责），除非显式设 CODE_WATCHER_IN_GATEWAY=1。"""
+    global _code_watcher_started
+    if _code_watcher_started or not _truthy(os.getenv("CODE_WATCHER_IN_GATEWAY", "0")):
+        return
+    _code_watcher_started = True
+    poll_interval = int(os.getenv("CODE_WATCHER_POLL_SEC", "10") or 10)
+
+    def watcher_loop():
+        from engine import code_watcher
+        code_watcher.run_loop(interval=poll_interval)
+
+    threading.Thread(target=watcher_loop, name="code-watcher", daemon=True).start()
+
+
 def create_app():
     app = Flask(__name__)
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
@@ -58,6 +74,7 @@ def create_app():
     @app.before_request
     def _ensure_goal_watchdog():
         _start_goal_watchdog_once()
+        _start_code_watcher_once()
 
     # 注册路由
     from gateway.routes.auth import bp as auth_bp
@@ -67,6 +84,7 @@ def create_app():
     from gateway.routes.requirement import bp as req_bp
     from gateway.routes.repo import bp as repo_bp
     from gateway.routes.settings import bp as settings_bp
+    from gateway.routes.upload import bp as upload_bp
 
     app.register_blueprint(auth_bp, url_prefix='/auth')
     app.register_blueprint(agent_bp, url_prefix='/ai/agent')
@@ -75,6 +93,7 @@ def create_app():
     app.register_blueprint(req_bp, url_prefix='/ai/req')
     app.register_blueprint(repo_bp, url_prefix='/ai/repo')
     app.register_blueprint(settings_bp, url_prefix='/ai/settings')
+    app.register_blueprint(upload_bp, url_prefix='/ai/upload')
 
     # TODO: 后续注册
     # from gateway.routes.requirement import bp as req_bp

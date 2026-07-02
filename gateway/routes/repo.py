@@ -19,6 +19,89 @@ def _get_repo_base():
     return os.path.expanduser('~/Documents/work_code')
 
 
+def _detect_default_branch(git_url: str, local_path: str) -> str:
+    """自动检测仓库主分支（不要求用户填）。"""
+    import subprocess
+    # 本地已有仓库，读 HEAD
+    if os.path.isdir(os.path.join(local_path, '.git')):
+        try:
+            r = subprocess.run(['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
+                              cwd=local_path, capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return r.stdout.strip().split('/')[-1]
+        except Exception:
+            pass
+    # 远程探测
+    try:
+        r = subprocess.run(['git', 'ls-remote', '--symref', git_url, 'HEAD'],
+                          capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if 'ref:' in line and 'HEAD' in line:
+                    return line.split('refs/heads/')[-1].split()[0]
+    except Exception:
+        pass
+    return 'main'
+
+
+def _detect_project_type(local_path: str) -> str:
+    """根据特征文件判断项目类型。"""
+    if not os.path.isdir(local_path):
+        return ''
+    checks = [
+        ('build.gradle', 'android'), ('AndroidManifest.xml', 'android'),
+        ('Podfile', 'ios'), ('Info.plist', 'ios'),
+        ('package.json', 'web'), ('pom.xml', 'java'),
+        ('go.mod', 'go'), ('requirements.txt', 'python'), ('app.py', 'python'),
+    ]
+    for fname, lang in checks:
+        for root, dirs, files in os.walk(local_path):
+            if fname in files:
+                return lang
+            # 只扫前两层
+            depth = root.replace(local_path, '').count(os.sep)
+            if depth >= 2:
+                dirs.clear()
+    return ''
+
+
+def _ensure_repo_ready(git_url: str, local_path: str, branch: str) -> str:
+    """确保仓库已 clone + checkout 到指定分支，返回状态。"""
+    import subprocess
+    if not os.path.isdir(os.path.join(local_path, '.git')):
+        # clone
+        try:
+            subprocess.run(['git', 'clone', git_url, local_path],
+                          capture_output=True, timeout=300)
+        except Exception:
+            return 'pending'
+    # checkout
+    try:
+        subprocess.run(['git', 'fetch', 'origin'], cwd=local_path, capture_output=True, timeout=60)
+        subprocess.run(['git', 'checkout', branch], cwd=local_path, capture_output=True, timeout=30)
+        subprocess.run(['git', 'pull', 'origin', branch], cwd=local_path, capture_output=True, timeout=60)
+        return 'ready'
+    except Exception:
+        return 'pending'
+
+
+def _get_head_commit(local_path: str) -> dict | None:
+    """读取本地仓库 HEAD 的 commit hash + message + time。"""
+    import subprocess
+    if not os.path.isdir(local_path):
+        return None
+    try:
+        r = subprocess.run(
+            ['git', 'log', '-1', '--format=%H|%s|%ct'],
+            cwd=local_path, capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and '|' in r.stdout:
+            parts = r.stdout.strip().split('|', 2)
+            return {"hash": parts[0][:8], "msg": parts[1][:80], "time": int(parts[2]) if parts[2].isdigit() else 0}
+    except Exception:
+        pass
+    return None
+
+
 @bp.route('/list', methods=['GET'])
 @require_auth
 def repo_list():
@@ -26,6 +109,14 @@ def repo_list():
     parent_id = request.args.get('parent_id')
     query = {"parent_repo_id": parent_id} if parent_id else {}
     repos = list(get_collection(COL).find(query, {"_id": 0}).sort("created_at", -1))
+    # 补充最新 commit 信息（从本地 git 读）
+    for r in repos:
+        if not r.get("last_commit") and r.get("local_path") and r.get("status") in ("ready", "vector_ready", "vectorized"):
+            commit_info = _get_head_commit(r["local_path"])
+            if commit_info:
+                r["last_commit"] = commit_info["hash"]
+                r["last_commit_msg"] = commit_info["msg"]
+                r["last_commit_time"] = commit_info["time"]
     return ok({"repos": repos, "total": len(repos)})
 
 
@@ -51,8 +142,8 @@ def repo_create():
     data = request.get_json() or {}
     repo_name = data.get('repo_name', '').strip()
     git_url = data.get('git_url', '').strip()
-    branch = data.get('branch', 'master').strip()
-    language = data.get('language', 'android')
+    branch = data.get('branch', '').strip()  # 空=自动检测主分支
+    language = data.get('language', '')
 
     if not repo_name or not git_url:
         return err("缺少 repo_name 或 git_url")
@@ -60,6 +151,17 @@ def repo_create():
     base_path = _get_repo_base()
     local_path = os.path.join(base_path, repo_name)
     repo_id = uuid.uuid4().hex[:12]
+
+    # 自动检测主分支（不要求用户填）
+    if not branch:
+        branch = _detect_default_branch(git_url, local_path)
+
+    # 自动检测项目语言/类型
+    if not language:
+        language = _detect_project_type(local_path)
+
+    # 自动 clone（如果本地还没有）+ checkout
+    status = _ensure_repo_ready(git_url, local_path, branch)
 
     doc = {
         "repo_id": repo_id,
@@ -69,7 +171,7 @@ def repo_create():
         "local_path": local_path,
         "parent_repo_id": None,
         "language": language,
-        "status": "pending",  # pending → cloning → ready → vectorizing → vectorized
+        "status": status,
         "lock": {"locked": False, "locked_by": "", "locked_at": 0},
         "last_commit": "",
         "last_vectorized_commit": "",
@@ -79,9 +181,7 @@ def repo_create():
     }
     get_collection(COL).insert_one(doc)
 
-    # TODO: 触发 git clone 任务（写入 ai_task_queue）
-
-    return ok({"repo_id": repo_id})
+    return ok({"repo_id": repo_id, "branch": branch, "status": status})
 
 
 @bp.route('/add_branch', methods=['POST'])
@@ -104,10 +204,20 @@ def repo_add_branch():
     if existing:
         return err(f"分支 {branch} 已存在")
 
-    base_path = _get_repo_base()
-    dir_name = f"{parent['repo_name']}__{branch.replace('/', '_')}"
-    local_path = os.path.join(base_path, dir_name)
+    # 复用父仓库的 local_path（同一个 git 目录，只 fetch 分支）
+    local_path = parent.get("local_path", "")
     repo_id = uuid.uuid4().hex[:12]
+
+    # fetch 分支确保可用
+    import subprocess
+    status = "ready"
+    if local_path and os.path.isdir(local_path):
+        try:
+            subprocess.run(['git', 'fetch', 'origin', branch], cwd=local_path, capture_output=True, timeout=60)
+        except Exception:
+            status = "pending"
+    else:
+        status = "pending"
 
     doc = {
         "repo_id": repo_id,
@@ -117,7 +227,7 @@ def repo_add_branch():
         "local_path": local_path,
         "parent_repo_id": parent_id,
         "language": parent.get("language", ""),
-        "status": "pending",
+        "status": status,
         "lock": {"locked": False, "locked_by": "", "locked_at": 0},
         "last_commit": "",
         "last_vectorized_commit": "",
@@ -182,9 +292,31 @@ def repo_vectorize():
 
     get_collection(COL).update_one({"repo_id": repo_id}, {"$set": {"status": "vectorizing", "updated_at": int(time.time())}})
 
-    # TODO: 写入 ai_task_queue 触发 repo_vectorize_task
+    # 写入任务队列触发 worker 向量化
+    task_id = uuid.uuid4().hex[:16]
+    embed_model = data.get('embed_model', 'gemini')
+    get_collection("ai_task_queue").insert_one({
+        "task_id": task_id,
+        "task_type": 10,  # repo_vectorize
+        "status": 1,  # pending
+        "payload": {"repo_id": repo_id, "repo_name": repo.get("repo_name", ""), "local_path": repo.get("local_path", ""), "language": repo.get("language", ""), "branch": repo.get("branch", ""), "embed_model": embed_model},
+        "created_at": int(time.time()),
+    })
 
     return ok({"repo_id": repo_id, "status": "vectorizing"})
+
+
+@bp.route('/logs', methods=['GET'])
+@require_auth
+def repo_logs():
+    """获取仓库操作日志（向量化进度等）"""
+    repo_id = request.args.get('repo_id', '')
+    offset = int(request.args.get('offset', 0))
+    if not repo_id:
+        return err("缺少 repo_id")
+    repo = get_collection(COL).find_one({"repo_id": repo_id}, {"_id": 0, "vectorize_logs": 1})
+    logs = (repo or {}).get("vectorize_logs", [])
+    return ok({"logs": logs[offset:], "total": len(logs)})
 
 
 @bp.route('/lock', methods=['POST'])
@@ -194,6 +326,10 @@ def repo_lock():
     repo_id = data.get('repo_id', '')
     if not repo_id:
         return err("缺少 repo_id")
+    repo = get_collection(COL).find_one({"repo_id": repo_id}, {"_id": 0, "lock": 1})
+    if repo and repo.get("lock", {}).get("locked"):
+        locked_by = repo["lock"].get("locked_by", "未知")
+        return err(f"仓库已被 {locked_by} 锁定，请等待释放")
     get_collection(COL).update_one({"repo_id": repo_id}, {"$set": {
         "lock.locked": True, "lock.locked_by": get_current_user(), "lock.locked_at": int(time.time())
     }})

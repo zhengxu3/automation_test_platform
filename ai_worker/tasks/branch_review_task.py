@@ -49,10 +49,13 @@ class BranchReviewTask(BaseTaskHandler):
     async def run(self):
         inputs = self.payload.get("inputs", {})
         mode = inputs.get("mode", "最近更新")
-        repo_name = self.payload.get("repo_name", "")
-        repo_path = self.payload.get("repo_path", "")
-        base_branch = self.payload.get("base_branch", "master")
-        target_branch = self.payload.get("target_branch", base_branch)
+        repo_name = self.payload.get("repo_name", "") or inputs.get("repo_name", "")
+        repo_path = self.payload.get("repo_path", "") or inputs.get("repo_path", "")
+        base_branch = self.payload.get("base_branch", "") or inputs.get("base_branch", "master")
+        target_branch = self.payload.get("target_branch", "") or inputs.get("target_branch", base_branch)
+        # before_ref/after_ref：精确 commit 范围（code_update_round 传入）
+        before_ref = self.payload.get("before_ref") or inputs.get("before_ref") or None
+        after_ref = self.payload.get("after_ref") or inputs.get("after_ref") or None
 
         # 路径自适应
         import platform, yaml
@@ -76,7 +79,11 @@ class BranchReviewTask(BaseTaskHandler):
 
         # ========== 1. Git Diff ==========
         self.log("🔍 执行 Git Diff...")
-        if mode == "最近更新":
+        if before_ref and after_ref:
+            # 精确 commit 范围（code_update_round 指定）
+            self.log(f"📌 精确范围: {before_ref[:8]}..{after_ref[:8]}")
+            diff_result = await asyncio.to_thread(self._git_diff_refs, repo_path, before_ref, after_ref)
+        elif mode == "最近更新":
             diff_result = await asyncio.to_thread(self._git_diff_head, repo_path)
         else:
             diff_result = await asyncio.to_thread(self._git_diff_files, repo_path, base_branch, target_branch)
@@ -106,7 +113,7 @@ class BranchReviewTask(BaseTaskHandler):
 
         # ========== 2. 读取变更内容 ==========
         self.log("📄 读取变更内容...")
-        diff_content = await asyncio.to_thread(self._get_diff_content, repo_path, base_branch, target_branch, mode)
+        diff_content = await asyncio.to_thread(self._get_diff_content, repo_path, base_branch, target_branch, mode, before_ref, after_ref)
 
         # ========== 3. 组装 Prompt + 调用 LLM ==========
         self.log("🧠 组装上下文，调用大模型...")
@@ -231,10 +238,52 @@ class BranchReviewTask(BaseTaskHandler):
 
         branch_review 负责读 diff/路由/业务代码，因此由它产 interface_doc；
         api_test 只消费该文档生成和执行测试。
+
+        2026-06-25: AST 精确分析优先——用 tree-sitter 方法级 diff 精确圈定受影响接口，
+        再把 AST 结果作为 grounding 喂给 LLM 补充 request/response/错误码语义。
         """
+        # ── Phase 0: AST 精确分析（确定性，零 token）──
+        ast_endpoints = []
+        ast_changed_methods = []
+        ast_ripple_methods = []
+        ast_files_analyzed = 0
+        try:
+            from engine.ast_blast_radius import analyze_repo_diff
+            ast_result = analyze_repo_diff(repo_path, changed)
+            ast_files_analyzed = ast_result.files_analyzed
+            ast_endpoints = [
+                {"method": ep.method, "path": ep.path,
+                 "handler": ep.handler, "file": ep.file, "source": "ast"}
+                for ep in ast_result.affected_endpoints
+            ]
+            ast_changed_methods = [
+                {"name": m.name, "class_name": m.class_name, "file": m.file_path,
+                 "start_line": m.start_line, "end_line": m.end_line,
+                 "route": f"{m.route_method} {m.route_path}" if m.route_path else ""}
+                for m in ast_result.changed_methods
+            ]
+            ast_ripple_methods = ast_result.ripple_methods[:20]
+            if ast_changed_methods:
+                self.log(f"🌳 AST 方法级变更: {len(ast_changed_methods)} 个方法被修改")
+            if ast_ripple_methods:
+                self.log(f"🌐 调用链波及: {len(ast_ripple_methods)} 个上游调用方")
+            if ast_endpoints:
+                self.log(f"🌳 AST 精确定位受影响接口: {len(ast_endpoints)} 个")
+        except Exception as e:
+            self.log(f"⚠️ AST 分析降级: {e}", "warning")
+
+        # ── Phase 1: 正则扫描全量路由（兜底 + 校验 AST 结果）──
         routes = self._discover_routes(repo_path)
-        if not routes:
-            return {"affected_endpoints": [], "summary": "未扫描到显式接口路由", "confidence": 0.0}
+        if not routes and not ast_endpoints and not ast_changed_methods:
+            return {"affected_endpoints": [], "blast_radius": [], "summary": "未扫描到显式接口路由", "confidence": 0.0}
+
+        # 如果 AST 已精确命中，以 AST 结果为主，LLM 只补语义
+        ast_grounding = ""
+        if ast_endpoints:
+            ast_grounding = "\n## AST 精确定位的受影响接口（方法级 diff，最高优先级）\n"
+            for ep in ast_endpoints:
+                ast_grounding += f"- {ep['method']} {ep['path']} (handler: {ep['handler']}, file: {ep['file']})\n"
+            ast_grounding += "\n以上是 tree-sitter AST 确定性分析的结果，请优先输出这些接口的详细契约。\n"
 
         route_text = "\n".join(
             f"- {r['method']} {r['path']} ({r['file']}:{r['line']}) {r.get('code', '')}"
@@ -249,7 +298,8 @@ class BranchReviewTask(BaseTaskHandler):
             "请产出给 API 测试智能体使用的结构化接口文档。"
             "只根据 diff/路由/需求里能 grounding 的内容写请求参数、响应字段、错误码；不知道就写 unknown，禁止臆造。"
         )
-        user = f"""## 需求上下文
+        user = f"""{ast_grounding}
+## 需求上下文
 {requirement_context[:2000]}
 
 ## 代码分析报告
@@ -299,6 +349,8 @@ class BranchReviewTask(BaseTaskHandler):
         endpoints = []
         known = {(r["method"], r["path"]) for r in routes}
         known_paths = {r["path"] for r in routes}
+        # AST 精确结果的 path 集合（无条件允许）
+        ast_paths = {(ep["method"], ep["path"]) for ep in ast_endpoints}
         for ep in doc.get("affected_endpoints", []) or []:
             if not isinstance(ep, dict):
                 continue
@@ -306,18 +358,99 @@ class BranchReviewTask(BaseTaskHandler):
             path = str(ep.get("path") or "")
             if not path:
                 continue
+            # AST 精确命中的无条件保留
+            if (method, path) in ast_paths:
+                ep["method"] = method
+                ep["path"] = path
+                ep["source"] = "ast+llm"
+                endpoints.append(ep)
+                continue
             # 允许 LLM 在已知 path 上补 method；不允许凭空造不存在 path。
             if (method, path) not in known and path not in known_paths:
                 continue
             ep["method"] = method
             ep["path"] = path
             endpoints.append(ep)
+        # 补充 AST 发现但 LLM 未覆盖的接口（确保 AST 结果不丢失）
+        covered = {(ep.get("method"), ep.get("path")) for ep in endpoints}
+        for ast_ep in ast_endpoints:
+            if (ast_ep["method"], ast_ep["path"]) not in covered:
+                endpoints.append({
+                    "method": ast_ep["method"],
+                    "path": ast_ep["path"],
+                    "affected_reason": f"方法级 diff 精确命中 (handler: {ast_ep['handler']})",
+                    "impact": "direct",
+                    "source": "ast",
+                    "grounding": [ast_ep["file"]],
+                })
         doc["affected_endpoints"] = endpoints
         doc.setdefault("summary", f"识别受影响接口 {len(endpoints)} 个")
         doc.setdefault("confidence", result.data.get("confidence", 0.5) if isinstance(result.data, dict) else 0.5)
         doc["source"] = "branch_review"
         doc["route_count"] = len(routes)
+        # ── AST 方法级爆炸范围（所有项目都生效）──
+        # 从 LLM 分析文本中为每个方法提取功能描述
+        self._enrich_blast_descriptions(ast_changed_methods, analysis_text)
+        doc["blast_radius"] = ast_changed_methods
+        doc["ripple_methods"] = ast_ripple_methods
+        doc["ast_summary"] = {
+            "tool": "tree-sitter",
+            "files_analyzed": ast_files_analyzed,
+            "methods_changed": len(ast_changed_methods),
+            "endpoints_found": len(ast_endpoints),
+            "ripple_count": len(ast_ripple_methods),
+        } if (ast_changed_methods or ast_endpoints) else None
+        # ── 超出本次玩法范围提醒 ──
+        doc["out_of_scope_warnings"] = self._detect_out_of_scope(
+            endpoints, requirement_context, analysis_text)
         return doc
+
+    @staticmethod
+    def _detect_out_of_scope(endpoints: list, requirement_context: str, analysis_text: str) -> list:
+        """检测受影响接口中超出本次需求/玩法范围的，返回提醒列表。
+
+        只对 impact=indirect 的接口发出提醒——direct 是本次改动直接触碰的方法，
+        属于"改了就该测"；indirect 才是"波及到了范围外"需要提醒的。
+        """
+        if not endpoints or not requirement_context:
+            return []
+        warnings = []
+        for ep in endpoints:
+            if ep.get("impact") != "indirect":
+                continue
+            warnings.append({
+                "method": ep.get("method"),
+                "path": ep.get("path"),
+                "reason": ep.get("affected_reason") or "间接影响，可能超出本次玩法范围",
+            })
+        return warnings
+
+    @staticmethod
+    def _enrich_blast_descriptions(methods: list, analysis_text: str):
+        """从 LLM 分析文本中为每个方法提取一句中文功能描述。"""
+        if not methods or not analysis_text:
+            return
+        lines = analysis_text.split("\n")
+        for m in methods:
+            name = m.get("name", "")
+            class_name = m.get("class_name", "")
+            # 在分析文本中找包含方法名或类名的行
+            desc = ""
+            for line in lines:
+                stripped = line.strip().lstrip("*-#·• ")
+                if not stripped or len(stripped) < 5:
+                    continue
+                # 精确匹配方法名
+                if name and name in line:
+                    desc = stripped[:100]
+                    break
+            if not desc and class_name:
+                for line in lines:
+                    stripped = line.strip().lstrip("*-#·• ")
+                    if class_name in line and len(stripped) > 10:
+                        desc = stripped[:100]
+                        break
+            m["description"] = desc
 
     @staticmethod
     def _parse_section_items(text: str, keyword: str) -> list:
@@ -345,6 +478,17 @@ class BranchReviewTask(BaseTaskHandler):
         return cases
 
     # ========== Git 操作 ==========
+    def _git_diff_refs(self, repo_path: str, before_ref: str, after_ref: str) -> dict:
+        """用精确的 commit 范围做 diff（before..after）。"""
+        try:
+            subprocess.run(["git", "fetch", "--all"], cwd=repo_path, capture_output=True, timeout=30)
+            result = subprocess.run(
+                ["git", "diff", "--name-status", f"{before_ref}..{after_ref}"],
+                cwd=repo_path, capture_output=True, text=True, timeout=30)
+            return self._parse_diff_output(result.stdout)
+        except Exception as e:
+            return {"changed": [], "deleted": [], "error": str(e)}
+
     def _git_diff_head(self, repo_path: str) -> dict:
         try:
             subprocess.run(["git", "pull", "--ff-only"], cwd=repo_path, capture_output=True, timeout=30)
@@ -362,9 +506,12 @@ class BranchReviewTask(BaseTaskHandler):
         except Exception as e:
             return {"changed": [], "deleted": [], "error": str(e)}
 
-    def _get_diff_content(self, repo_path: str, base: str, target: str, mode: str) -> str:
+    def _get_diff_content(self, repo_path: str, base: str, target: str, mode: str,
+                          before_ref: str = None, after_ref: str = None) -> str:
         try:
-            if mode == "最近更新":
+            if before_ref and after_ref:
+                cmd = ["git", "diff", f"{before_ref}..{after_ref}", "--stat", "-p"]
+            elif mode == "最近更新":
                 cmd = ["git", "diff", "HEAD~1", "--stat", "-p"]
             else:
                 ref = f"{base}...{target}" if "origin/" in target else f"{base}...origin/{target}"

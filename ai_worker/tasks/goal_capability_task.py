@@ -209,6 +209,8 @@ async def _exec_branch_review(task, goal, payload) -> dict:
         "repo_path": inp.get("repo_path", ""),
         "base_branch": inp.get("base_branch", "master"),
         "target_branch": inp.get("target_branch", inp.get("base_branch", "master")),
+        "before_ref": inp.get("before_ref"),
+        "after_ref": inp.get("after_ref"),
         "agent_id": payload.get("agent_id", ""),
         "system_prompt": payload.get("system_prompt", ""),
         "model_id": payload.get("model_id", "gemini_pro"),

@@ -57,6 +57,4 @@ def auth_check():
     session = get_collection("ai_sessions").find_one({"token": token}, {"_id": 0})
     if not session:
         return err("登录已失效", 401), 401
-    if int(time.time()) - session.get('created_at', 0) > 86400 * 7:
-        return err("登录已过期", 401), 401
     return ok({"username": session["username"], "name": session.get("name", ""), "role": session.get("role", "user")})

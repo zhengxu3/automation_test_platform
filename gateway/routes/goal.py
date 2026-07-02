@@ -15,6 +15,30 @@ from common.db import get_collection
 bp = Blueprint('goal', __name__)
 
 
+def _resolve_file_sources(sources):
+    """解析文件引用型 source：带 file_id 的 doc/testcase → 读文件内容注入。"""
+    from gateway.routes.upload import read_file_content
+    resolved = []
+    for src in sources:
+        stype = src.get("type", "")
+        file_id = src.get("file_id")
+        if file_id and stype in ("doc", "testcase"):
+            info = read_file_content(file_id)
+            if info:
+                resolved.append({
+                    **src,
+                    "type": info["category"],  # 以文件 category 为准
+                    "content": info["content"],
+                    "filename": info["filename"],
+                })
+            else:
+                # 文件找不到：保留原始 source 但标记
+                resolved.append({**src, "content": f"(文件 {file_id} 不存在或无法读取)"})
+        else:
+            resolved.append(src)
+    return resolved
+
+
 def _resolve_local_paths(sources):
     """repo source 缺 local_path 时，用 repo_id / git_url 去 ai_git_repos 反查已克隆的本地仓。
 
@@ -136,6 +160,16 @@ def goal_create():
     """
     data = request.get_json() or {}
 
+    # 防连点去重：同 title 5 秒内不重复创建
+    title = (data.get("title") or "").strip()
+    if title:
+        recent = get_collection("ai_goals").find_one(
+            {"title": title, "created_at": {"$gte": int(time.time()) - 5}},
+            {"_id": 0, "goal_id": 1}
+        )
+        if recent:
+            return ok({"goal_id": recent["goal_id"], "deduplicated": True})
+
     # 兼容旧字段 + 新 sources 模型
     sources = data.get("sources", [])
     if not sources:
@@ -148,8 +182,17 @@ def goal_create():
             if isinstance(repo, dict):
                 sources.append({"type": "repo", **repo})
 
+    # 解析文件引用：file_id → 读取内容注入 source
+    sources = _resolve_file_sources(sources)
+
     # 给地址型 repo 源补本地路径（本地已有则复用、不重 clone）
     sources = _resolve_local_paths(sources)
+
+    # 守护模式自动给 repo 加 watch
+    if data.get("completion_policy") == "continuous":
+        for s in sources:
+            if s.get("type") == "repo" and "watch" not in s:
+                s["watch"] = True
 
     goal_id = f"goal_{uuid.uuid4().hex[:8]}"
     doc = {
@@ -166,6 +209,7 @@ def goal_create():
             "max_runtime_sec": 3600, "max_device_minutes": 30,
         }),
         "callback_urls": data.get("callback_urls", []),   # 出站钩子
+        "notifications": data.get("notifications", []),  # 钉钉/飞书通知配置
         "status": "discovering",
         "goal_statement": "",
         "acceptance": [],
@@ -254,6 +298,18 @@ def goal_webhook():
                 after_ref=commit,
                 changed_files=changed_files if changed_files else None,
             )
+            # 发钉钉：代码提交检测通知（仅无 watcher 时发，避免重复）
+            _src = next((s for s in g.get("sources", []) if s.get("repo_id") == repo_id), {})
+            if not _src.get("watch"):
+                try:
+                    from common.notify import notify_code_detected
+                    _git_url = _src.get("git_url", "")
+                    _repo_label = _git_url.split("/")[-1].replace(".git", "") if "/" in _git_url else repo_id
+                    _role = _src.get("role", "")
+                    _display = f"{_role + ' · ' if _role else ''}{_repo_label}"
+                    notify_code_detected(g, repo_name=_display, branch=branch or _src.get("branch", ""), commit=commit or "", message=(data.get("commits", [{}])[0].get("message", "") if data.get("commits") else ""))
+                except Exception:
+                    pass
             activated.append(g["goal_id"])
         return ok({"action": "activated" if activated else "no_change",
                    "activated": activated, "busy": busy})
@@ -539,3 +595,233 @@ def goal_chat_history():
         {"goal_id": goal_id}, {"_id": 0}
     ).sort("timestamp", 1).limit(50))
     return ok({"messages": msgs})
+
+
+@bp.route('/update_watch', methods=['POST'])
+@require_auth
+def goal_update_watch():
+    """更新 Goal 某个 repo source 的自监控配置。"""
+    data = request.get_json() or {}
+    goal_id = data.get('goal_id', '')
+    repo_index = data.get('repo_index')
+    if not goal_id or repo_index is None:
+        return err("缺少 goal_id 或 repo_index")
+
+    goal = get_collection("ai_goals").find_one({"goal_id": goal_id}, {"_id": 0, "sources": 1})
+    if not goal:
+        return err("Goal 不存在", 404)
+
+    sources = goal.get("sources", [])
+    idx = int(repo_index)
+    # 找到第 idx 个 repo 类型 source
+    repo_indices = [i for i, s in enumerate(sources) if s.get("type") == "repo"]
+    if idx < 0 or idx >= len(repo_indices):
+        return err("repo_index 越界")
+    real_idx = repo_indices[idx]
+
+    update = {}
+    if "watch" in data:
+        update[f"sources.{real_idx}.watch"] = bool(data["watch"])
+    if "watch_interval" in data:
+        update[f"sources.{real_idx}.watch_interval"] = max(int(data["watch_interval"]), 10)
+
+    if update:
+        get_collection("ai_goals").update_one({"goal_id": goal_id}, {"$set": update})
+
+    return ok({"updated": list(update.keys())})
+
+
+@bp.route('/cases', methods=['GET'])
+@require_auth
+def get_cases():
+    """获取 goal 的 case 列表"""
+    goal_id = request.args.get('goal_id', '')
+    if not goal_id:
+        return err("缺少 goal_id")
+    if request.args.get('count_only'):
+        count = get_collection("ai_goal_cases").count_documents({"goal_id": goal_id})
+        return ok({"count": count})
+    cases = list(get_collection("ai_goal_cases").find({"goal_id": goal_id}, {"_id": 0}))
+    return ok({"cases": cases, "count": len(cases)})
+
+
+@bp.route('/event/<event_id>', methods=['GET'])
+def get_event_detail(event_id):
+    """获取单个事件详情 + 关联 artifact（无需登录，只读）"""
+    from bson import ObjectId
+    try:
+        event = get_collection("ai_goal_events").find_one({"_id": ObjectId(event_id)})
+    except Exception:
+        event = None
+    # 兜底：也支持字符串 _id 查找
+    if not event:
+        event = get_collection("ai_goal_events").find_one({"_id": event_id})
+    if not event:
+        return err("事件不存在")
+    event["_id"] = str(event["_id"])
+    goal_id = event.get("goal_id", "")
+    # 关联 artifact（同 step_id）
+    step_id = (event.get("payload") or {}).get("step_id", "")
+    artifact = None
+    if step_id:
+        artifact = get_collection("ai_goal_artifacts").find_one(
+            {"goal_id": goal_id, "step_id": step_id},
+            {"_id": 0}, sort=[("created_at", -1)])
+    # 补充 commit 详情（提交人/message）
+    commit_detail = None
+    code_update_event = None
+    payload = event.get("payload") or {}
+
+    # 如果是 case_reminder，找同一轮的 code_update_round 事件合并
+    if event.get("event") == "case_reminder":
+        code_update_event = get_collection("ai_goal_events").find_one(
+            {"goal_id": goal_id, "event": "code_update_round", "timestamp": {"$lte": event.get("timestamp", 0)}},
+            {"_id": 0}, sort=[("timestamp", -1)])
+        if code_update_event:
+            cu_payload = code_update_event.get("payload") or {}
+            # 取 commit 详情
+            goal_doc = get_collection("ai_goals").find_one({"goal_id": goal_id}, {"_id": 0, "sources": 1})
+            src = next((s for s in (goal_doc or {}).get("sources", []) if s.get("repo_id") == cu_payload.get("changed_repo_id")), {})
+            local_path = src.get("local_path", "")
+            after_ref = cu_payload.get("after", "")
+            if local_path and after_ref:
+                import subprocess
+                try:
+                    out = subprocess.check_output(["git", "log", "-1", "--format=%H|%an|%ae|%s", after_ref], cwd=local_path, stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+                    parts = out.split("|", 3)
+                    if len(parts) == 4:
+                        commit_detail = {"hash": parts[0][:8], "author": parts[1], "email": parts[2], "message": parts[3]}
+                except Exception:
+                    pass
+
+    elif event.get("event") == "code_update_round" and payload.get("changed_repo_id"):
+        goal_doc = get_collection("ai_goals").find_one({"goal_id": goal_id}, {"_id": 0, "sources": 1})
+        src = next((s for s in (goal_doc or {}).get("sources", []) if s.get("repo_id") == payload["changed_repo_id"]), {})
+        local_path = src.get("local_path", "")
+        after_ref = payload.get("after", "")
+        if local_path and after_ref:
+            import subprocess
+            try:
+                out = subprocess.check_output(["git", "log", "-1", "--format=%H|%an|%ae|%s", after_ref], cwd=local_path, stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+                parts = out.split("|", 3)
+                if len(parts) == 4:
+                    commit_detail = {"hash": parts[0][:8], "author": parts[1], "email": parts[2], "message": parts[3]}
+            except Exception:
+                pass
+
+    return ok({"event": event, "artifact": artifact, "commit_detail": commit_detail, "code_update_event": code_update_event})
+
+
+@bp.route('/case/<case_id>', methods=['GET'])
+@require_auth
+def get_case_detail(case_id):
+    """获取单条 case 详情"""
+    goal_id = request.args.get('goal_id', '')
+    query = {"case_id": case_id}
+    if goal_id:
+        query["goal_id"] = goal_id
+    case = get_collection("ai_goal_cases").find_one(query, {"_id": 0})
+    if not case:
+        return err("Case 不存在")
+    return ok({"case": case})
+
+
+@bp.route('/upload_cases', methods=['POST'])
+@require_auth
+def upload_cases():
+    """上传 PDF/HTML 文件，LLM 提取结构化 case 存入 ai_goal_cases"""
+    import time as _t
+    goal_id = request.form.get('goal_id', '')
+    if not goal_id:
+        return err("缺少 goal_id")
+
+    files = request.files.getlist('files')
+    if not files:
+        return err("未上传文件")
+
+    total_cases = 0
+    for f in files:
+        filename = f.filename or ""
+        ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+        raw = f.read()
+
+        if ext == 'pdf':
+            import fitz
+            doc = fitz.open(stream=raw, filetype="pdf")
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+        elif ext in ('html', 'htm'):
+            from bs4 import BeautifulSoup
+            text = BeautifulSoup(raw, 'html.parser').get_text(separator="\n")
+        else:
+            return err(f"不支持的文件类型: {ext}")
+
+        cases = _extract_cases_from_text(text, goal_id, filename)
+        if cases:
+            get_collection("ai_goal_cases").insert_many(cases)
+            total_cases += len(cases)
+
+    return ok({"count": total_cases, "goal_id": goal_id})
+
+
+def _extract_cases_from_text(text: str, goal_id: str, source_file: str) -> list:
+    """用 LLM 从文本中提取结构化 case 列表。保留原始内容不修改。"""
+    import time as _t
+    from llm.structured import generate_structured
+
+    # 分批处理大文本（每批 12000 字符，有重叠避免截断 case）
+    BATCH = 12000
+    OVERLAP = 500
+    batches = []
+    for start in range(0, len(text), BATCH - OVERLAP):
+        batches.append(text[start:start + BATCH])
+
+    all_cases = []
+    for batch_text in batches:
+        result = generate_structured(
+            system_prompt=(
+                "你是测试用例提取专家。从文本中识别并提取每一条测试用例。\n"
+                "规则：\n"
+                "1. 完整保留原始用例内容（步骤、预期结果），不要修改、不要缩写\n"
+                "2. title 取原文的用例标题/场景名\n"
+                "3. module 取这条用例所属的功能模块(如 组队流程、状态机、匹配 等业务模块名)\n"
+                "4. steps 完整保留原始操作步骤\n"
+                "5. expected 完整保留原始预期结果\n"
+                "6. priority 从原文标注读取（P0/P1/P2），没有则默认 P1\n"
+                "7. 不要遗漏任何用例，每个测试场景/测试点都算一条\n"
+            ),
+            user_prompt=(
+                f'从以下文本中提取所有测试用例，返回 JSON：\n'
+                f'{{"cases": [{{"case_id": "TC-001", "title": "原始标题", "module": "业务模块名", '
+                f'"steps": "完整原始步骤", "expected": "完整原始预期结果", "priority": "P0"}}]}}\n\n'
+                f"文本内容：\n{batch_text}"
+            ),
+            schema={"required": ["cases"], "types": {"cases": "list"}},
+            default={"cases": []},
+            require_confidence=False,
+        )
+        for c in (result.data.get("cases") or []):
+            all_cases.append(c)
+
+    # 去重（按 title）
+    seen_titles = set()
+    now = int(_t.time())
+    cases = []
+    for c in all_cases:
+        title = c.get("title", "").strip()
+        if not title or title in seen_titles:
+            continue
+        seen_titles.add(title)
+        cases.append({
+            "case_id": f"TC-{len(cases)+1:03d}",
+            "goal_id": goal_id,
+            "title": title,
+            "module": c.get("module", ""),
+            "steps": c.get("steps", ""),
+            "expected": c.get("expected", ""),
+            "priority": c.get("priority", "P1"),
+            "api_info": {},  # 不猜接口信息
+            "source_file": source_file,
+            "created_at": now,
+        })
+    return cases

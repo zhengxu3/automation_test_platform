@@ -139,3 +139,21 @@ def acceptance_to_reset(acceptance: list, touched_sides: set):
         if bucket and bucket in touched_sides:
             ids.add(a.get("id"))
     return ids
+
+
+def ast_changed_endpoints(repo_path: str, changed_files: list,
+                          base_ref: str = "HEAD~1", head_ref: str = "HEAD") -> list:
+    """用 AST 精确定位受影响接口（方法级 diff）。
+
+    返回 list[dict]，每个 dict 含 method/path/handler/file。
+    tree-sitter 不可用或无结果时返回空列表。
+    """
+    try:
+        from engine.ast_blast_radius import analyze_repo_diff
+        result = analyze_repo_diff(repo_path, changed_files, base_ref, head_ref)
+        return [
+            {"method": ep.method, "path": ep.path, "handler": ep.handler, "file": ep.file}
+            for ep in result.affected_endpoints
+        ]
+    except Exception:
+        return []
